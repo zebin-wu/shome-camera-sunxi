@@ -2,24 +2,29 @@
 #include "vencoder.h"
 #include "debug.h"
 
+#include <iostream>
 #include <cstdio>
 #include <cstring>
 #include <unistd.h>
 #include <algorithm>
 #include <signal.h>
 #include <pthread.h>
+#include <semaphore.h>
+#include <queue>
 
 #define DEV_PATH "/dev/video0"
 #define OUT_PATH "test.264"
 
-struct Venc_context {
-    pthread_t    tid;
-    FILE         *out_file;
-    VideoEncoder *pEncoder;
-    VencBaseConfig baseConfig;
-    VencInputBuffer input_buffer;
+static struct Venc_context {
+    pthread_t    tid; //编码线程
+    FILE         *out_file; //输出文件
+    VideoEncoder *pEncoder; //编码器
+    VencBaseConfig baseConfig; //编码器配置
+    queue<VencInputBuffer *> inputQue; //input buffer queue
+    //lock 
     pthread_mutex_t mutex;
-};
+    pthread_cond_t cond;
+} *venc_cxt;
 
 static Camera *camera;
 
@@ -41,21 +46,27 @@ void *encode_thread(void *data)
     Venc_context *venc_cxt = ( Venc_context *)data;
     VencOutputBuffer out_buffer;
     while(!camera->isLoop());
-    sleep(1);
     while(camera->isLoop())
     {
         pthread_mutex_lock(&venc_cxt->mutex);
+        while(venc_cxt->inputQue.empty()) //保证队列为空时才进入
+        {
+            pthread_cond_wait(&venc_cxt->cond, &venc_cxt->mutex);
+        }
         if(ret = VideoEncodeOneFrame(venc_cxt->pEncoder))
         {
             loge("encoder failed. err:%d\n", ret);
             pthread_mutex_unlock(&venc_cxt->mutex);
             continue;
         }
-        AlreadyUsedInputBuffer(venc_cxt->pEncoder, &venc_cxt->input_buffer);
-        ReturnOneAllocInputBuffer(venc_cxt->pEncoder, &venc_cxt->input_buffer);
-        camera->returnFrame(venc_cxt->input_buffer.nID);
+        VencInputBuffer *input_buffer = venc_cxt->inputQue.front();
+        venc_cxt->inputQue.pop();
+        AlreadyUsedInputBuffer(venc_cxt->pEncoder, input_buffer);
+        ReturnOneAllocInputBuffer(venc_cxt->pEncoder, input_buffer);
+        camera->returnFrame(input_buffer->nID);
+        //解锁
         pthread_mutex_unlock(&venc_cxt->mutex);
-        
+        delete input_buffer;
         if(ret = GetOneBitstreamFrame(venc_cxt->pEncoder, &out_buffer))
         {
             loge("getStream err. err:%d\n", ret);
@@ -68,16 +79,16 @@ void *encode_thread(void *data)
         }
         FreeOneBitStreamFrame(venc_cxt->pEncoder, &out_buffer);
     }
-
-    return (void *)0;
+    logd("encoder end\n");
+    return NULL;
 }
 
 void dealData(struct v4l2_buffer *runbuf, struct MemInfo *memMap, void *tag)
 {
     if(!tag)    return;
     Venc_context *venc_cxt = (Venc_context *)tag;
-    VencInputBuffer *input_buffer = &venc_cxt->input_buffer;
-    pthread_mutex_lock(&venc_cxt->mutex);
+    //将buf入队
+    VencInputBuffer *input_buffer = new VencInputBuffer;
     GetOneAllocInputBuffer(venc_cxt->pEncoder, input_buffer);
     input_buffer->nID = runbuf->index;
     yuv_422to420p((uint8_t *)memMap->addr, input_buffer->pAddrVirY, input_buffer->pAddrVirC, 
@@ -88,15 +99,21 @@ void dealData(struct v4l2_buffer *runbuf, struct MemInfo *memMap, void *tag)
     {
         loge("venc input buffer is full, skip this frame.\n");
     }
+    //加入到input queue
+    pthread_mutex_lock(&venc_cxt->mutex);
+    venc_cxt->inputQue.push(input_buffer);
     pthread_mutex_unlock(&venc_cxt->mutex);
+    pthread_cond_signal(&venc_cxt->cond);
 }
 
 int main()
 {
+    int ret;
     sigal_init();
-    Venc_context *venc_cxt = new Venc_context;
-    //memset(venc_cxt, 0, sizeof(Venc_context));
+    venc_cxt = new Venc_context;
+    //lock init
     venc_cxt->mutex = PTHREAD_MUTEX_INITIALIZER;
+    venc_cxt->cond = PTHREAD_COND_INITIALIZER;
     //out file
     venc_cxt->out_file = createOutFile(OUT_PATH);
     if(!venc_cxt->out_file)    return -1;
@@ -148,7 +165,6 @@ int main()
 	    logd("the sps_pps :%02x\n", *(sps_pps_data.pBuffer+head_num));
     
     //alloc buf
-    
     VencAllocateBufferParam bufferParam;
     memset(&bufferParam, 0 ,sizeof(VencAllocateBufferParam));
     bufferParam.nSizeY = venc_cxt->baseConfig.nInputWidth * venc_cxt->baseConfig.nInputHeight;
@@ -160,6 +176,7 @@ int main()
     camera = new Camera(DEV_PATH);
     
     list<CameraFmt> *fmtlist = camera->getSupportfmt();
+    cout << "count " << fmtlist->size() << endl;
 #ifdef DEBUG
     for(list<CameraFmt>::iterator it = fmtlist->begin(); it != fmtlist->end(); it++)
     {
@@ -167,10 +184,11 @@ int main()
     }
 #endif //DEBUG
 
-    camera->init(*fmtlist->begin());
+    if(!camera->init(*fmtlist->begin()))
+        goto err;
     delete fmtlist;
 
-    int ret = pthread_create(&venc_cxt->tid, NULL, encode_thread, venc_cxt);
+    ret = pthread_create(&venc_cxt->tid, NULL, encode_thread, venc_cxt);
     if(ret < 0)
     {
         logp("thread create err\n");
@@ -186,12 +204,16 @@ int main()
     pthread_join(venc_cxt->tid, NULL);
     VideoEncUnInit(venc_cxt->pEncoder);
     VideoEncDestroy(venc_cxt->pEncoder);
+    fclose(venc_cxt->out_file);
     delete camera;
     delete venc_cxt;
-    fclose(venc_cxt->out_file);
+    return 0;
 err:
     VideoEncDestroy(venc_cxt->pEncoder);
     fclose(venc_cxt->out_file);
+    delete camera;
+    delete venc_cxt;
+    return -1;
 }
 
 FILE *createOutFile(const char *path)
